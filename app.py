@@ -45,13 +45,8 @@ def extract_video_id(url: str):
 
 
 def pick_format(info: dict):
-    """
-    Elige un formato progresivo (video+audio juntos) http(s),
-    priorizando MP4/H.264 y dando gran preferencia a >=720p.
-    """
     formats = info.get("formats") or []
-    best = None
-    best_score = -1
+    best, best_score = None, -1
 
     for f in formats:
         url = f.get("url")
@@ -63,37 +58,35 @@ def pick_format(info: dict):
         ext = (f.get("ext") or "").lower()
         height = int(f.get("height") or 0)
 
-        # Solo progresivos http(s)
-        if vcodec == "none" or acodec == "none":
-            continue
-        if not protocol.startswith("http"):
-            continue
-
         score = 0
-        if ext == "mp4":
-            score += 10
-        if vcodec.startswith("avc") or "h264" in vcodec:
-            score += 10
-        score += min(height, 2160)
 
-        # Bonus grande para >=720p
-        if height >= 720:
-            score += 200
+        # 1) Prioriza MANIFEST adaptativo (HLS/DASH); m3u8 > mpd
+        if ext in ("m3u8", "mpd"):
+            score += 400
+            if ext == "m3u8": score += 50
+            # A veces el manifest no lista vcodec, pero si lo lista y es H.264, suma
+            if "avc" in vcodec or "h264" in vcodec: score += 50
+            score += min(height, 2160)
+
+        # 2) Si no, progresivo http(s) con H.264 (video+audio juntos)
+        elif protocol.startswith(
+                "http") and vcodec != "none" and acodec != "none":
+            if ext == "mp4": score += 30
+            if vcodec.startswith("avc") or "h264" in vcodec: score += 80
+            score += min(height, 2160)
+            if height >= 720: score += 100  # intenta 720p progresivo si existe
 
         if score > best_score:
-            best_score = score
-            best = f
+            best_score, best = score, f
 
     if best:
         return best
 
-    # Fallbacks
+    # Fallbacks muy raros
     rf = info.get("requested_formats") or []
     for f in rf:
-        if f.get("url"):
-            return f
-    if info.get("url"):
-        return info
+        if f.get("url"): return f
+    if info.get("url"): return info
     return None
 
 
@@ -102,11 +95,17 @@ def extract_stream(url: str):
         "quiet": True,
         "skip_download": True,
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+            "User-Agent":
+            "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            "Accept-Language":
+            "es-ES,es;q=0.9,en;q=0.8",
         },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android"]
+            }
+        }
     }
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
@@ -126,7 +125,8 @@ def extract_stream(url: str):
         else:
             expires_at = int(time.time()) + 3600
 
-        quality = chosen.get("format_note") or chosen.get("height") or "unknown"
+        quality = chosen.get("format_note") or chosen.get(
+            "height") or "unknown"
         ext = (chosen.get("ext") or "mp4").lower()
         mime = "video/mp4" if ext == "mp4" else f"video/{ext}"
         return stream_url, expires_at, str(quality), mime
