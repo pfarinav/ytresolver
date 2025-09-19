@@ -6,6 +6,7 @@ import urllib.parse as up
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 app = Flask(__name__)
 CORS(app)
@@ -90,6 +91,9 @@ def pick_format(info: dict):
     return None
 
 
+from yt_dlp.utils import DownloadError
+
+
 def extract_stream(url: str):
     ydl_opts = {
         "quiet": True,
@@ -110,26 +114,39 @@ def extract_stream(url: str):
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        chosen = pick_format(info)
-        if not chosen:
-            raise RuntimeError("No hay formato progresivo compatible")
-
-        stream_url = chosen["url"]
-
-        # Leer expiración
-        qs = up.parse_qs(up.urlparse(stream_url).query)
-        if "expire" in qs:
-            expires_at = int(qs["expire"][0])
+    from yt_dlp import YoutubeDL
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            chosen = pick_format(info)
+            if not chosen:
+                raise RuntimeError("No hay formato compatible")
+            # ... mismo return que antes ...
+    except DownloadError as e:
+        msg = str(e)
+        if "Requested format is not available" in msg:
+            # Volvemos a correr list-formats
+            with YoutubeDL({"listformats": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                fmts = []
+                for f in info.get("formats", []):
+                    fmts.append({
+                        "format_id":
+                        f.get("format_id"),
+                        "ext":
+                        f.get("ext"),
+                        "height":
+                        f.get("height"),
+                        "vcodec":
+                        f.get("vcodec"),
+                        "acodec":
+                        f.get("acodec"),
+                        "url":
+                        f.get("url")[:80] + "..." if f.get("url") else None
+                    })
+            raise RuntimeError("Formatos disponibles: " + str(fmts))
         else:
-            expires_at = int(time.time()) + 3600
-
-        quality = chosen.get("format_note") or chosen.get(
-            "height") or "unknown"
-        ext = (chosen.get("ext") or "mp4").lower()
-        mime = "video/mp4" if ext == "mp4" else f"video/{ext}"
-        return stream_url, expires_at, str(quality), mime
+            raise
 
 
 # ==========================
