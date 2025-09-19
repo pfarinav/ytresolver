@@ -45,106 +45,71 @@ def extract_video_id(url: str):
     return m.group(1) if m else None
 
 
-def pick_format(info: dict):
-    formats = info.get("formats") or []
-    best, best_score = None, -1
-
-    for f in formats:
-        url = f.get("url")
-        if not url:
-            continue
-        vcodec = (f.get("vcodec") or "").lower()
-        acodec = (f.get("acodec") or "").lower()
-        protocol = (f.get("protocol") or "").lower()
-        ext = (f.get("ext") or "").lower()
-        height = int(f.get("height") or 0)
-
-        score = 0
-
-        # 1) Prioriza MANIFEST adaptativo (HLS/DASH); m3u8 > mpd
-        if ext in ("m3u8", "mpd"):
-            score += 400
-            if ext == "m3u8": score += 50
-            # A veces el manifest no lista vcodec, pero si lo lista y es H.264, suma
-            if "avc" in vcodec or "h264" in vcodec: score += 50
-            score += min(height, 2160)
-
-        # 2) Si no, progresivo http(s) con H.264 (video+audio juntos)
-        elif protocol.startswith(
-                "http") and vcodec != "none" and acodec != "none":
-            if ext == "mp4": score += 30
-            if vcodec.startswith("avc") or "h264" in vcodec: score += 80
-            score += min(height, 2160)
-            if height >= 720: score += 100  # intenta 720p progresivo si existe
-
-        if score > best_score:
-            best_score, best = score, f
-
-    if best:
-        return best
-
-    # Fallbacks muy raros
-    rf = info.get("requested_formats") or []
-    for f in rf:
-        if f.get("url"): return f
-    if info.get("url"): return info
-    return None
-
-
-from yt_dlp.utils import DownloadError
-
-
 def extract_stream(url: str):
+    """
+    Fuerza itag 18 (MP4 progresivo 360p H.264+AAC).
+    Si no está disponible, devuelve error con lista de formatos para debug.
+    """
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
+        # Forzamos formato 18 explícitamente
+        "format": "18",
+        # Headers “realistas” ayudan a evitar consent/antibot
         "http_headers": {
-            "User-Agent":
-            "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-            "Accept-Language":
-            "es-ES,es;q=0.9,en;q=0.8",
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
         },
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android"]
-            }
-        }
+        # Mantengo el player_client android comentado porque estamos forzando 18
+        # "extractor_args": {"youtube": {"player_client": ["android"]}},
     }
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
-    from yt_dlp import YoutubeDL
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            chosen = pick_format(info)
-            if not chosen:
-                raise RuntimeError("No hay formato compatible")
-            # ... mismo return que antes ...
+
+            # Para itag 18 (progresivo) normalmente viene url directo en info
+            stream_url = info.get("url")
+            if not stream_url:
+                # A veces yt-dlp pone la selección en requested_formats
+                rf = info.get("requested_formats") or []
+                if rf and rf[0].get("url"):
+                    stream_url = rf[0]["url"]
+
+            if not stream_url:
+                raise RuntimeError("No se obtuvo URL para itag=18")
+
+            # Expiración desde query param 'expire'
+            qs = up.parse_qs(up.urlparse(stream_url).query)
+            expires_at = int(qs.get("expire", [int(time.time()) + 3600])[0])
+
+            # Calidad/mime
+            quality = info.get("format_note") or info.get("height") or "360p"
+            ext = (info.get("ext") or "mp4").lower()
+            mime = "video/mp4" if ext == "mp4" else f"video/{ext}"
+
+            return stream_url, expires_at, str(quality), mime
+
     except DownloadError as e:
+        # Si el formato 18 no está, devolvemos el listado para debug
         msg = str(e)
         if "Requested format is not available" in msg:
-            # Volvemos a correr list-formats
-            with YoutubeDL({"listformats": True}) as ydl:
+            with YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
                 info = ydl.extract_info(url, download=False)
                 fmts = []
                 for f in info.get("formats", []):
                     fmts.append({
-                        "format_id":
-                        f.get("format_id"),
-                        "ext":
-                        f.get("ext"),
-                        "height":
-                        f.get("height"),
-                        "vcodec":
-                        f.get("vcodec"),
-                        "acodec":
-                        f.get("acodec"),
-                        "url":
-                        f.get("url")[:80] + "..." if f.get("url") else None
+                        "format_id": f.get("format_id"),
+                        "ext": f.get("ext"),
+                        "height": f.get("height"),
+                        "vcodec": f.get("vcodec"),
+                        "acodec": f.get("acodec"),
                     })
-            raise RuntimeError("Formatos disponibles: " + str(fmts))
+            raise RuntimeError("itag=18 no disponible. Formatos: " + str(fmts))
         else:
             raise
 
@@ -185,6 +150,7 @@ def resolve():
         "quality": quality,
         "mime": mime,
         "graceSeconds": REFRESH_GRACE_SECONDS,
+        "forcedItag": 18
     }
     CACHE[vid] = payload
     return jsonify(payload), 200
